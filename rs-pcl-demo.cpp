@@ -1,9 +1,9 @@
-
 // License: Apache 2.0. See LICENSE file in root directory.
 // Copyright(c) 2015-2017 Intel Corporation. All Rights Reserved.
 
 #include <librealsense2/rs.hpp> // Include RealSense Cross Platform API
 #include "../../../examples/example.hpp" // Include short list of convenience functions for rendering
+#include <librealsense2/rsutil.h>  
 
 #include <pcl/point_types.h>
 #include <pcl/filters/passthrough.h>
@@ -15,6 +15,12 @@
 #include <pcl/features/normal_3d.h>
 #include <pcl/visualization/pcl_visualizer.h>
 #include <boost/thread/thread.hpp>
+
+
+#include "boost/date_time/posix_time/posix_time.hpp"
+namespace pt = boost::posix_time;
+
+
 
 using pcl_ptr = pcl::PointCloud<pcl::PointXYZ>::Ptr;
 
@@ -136,7 +142,6 @@ int main(int argc, char * argv[]) try
 	// depth stream config  
 	cfg.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);  
   
-  
 	// colour stream config  
 	cfg.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_RGB8, 30); 
 
@@ -146,10 +151,26 @@ int main(int argc, char * argv[]) try
     //The start function returns the pipeline profile which the pipeline used to start the device
     rs2::pipeline_profile profile = pipe.start(cfg);
     
+    auto sensor = profile.get_device().first<rs2::depth_sensor>();  
+        
+	// Declare filters
+    rs2::decimation_filter dec_filter;  // Decimation - reduces depth frame density
+    rs2::spatial_filter spat_filter;    // Spatial    - edge-preserving spatial smoothing
+    
+    
+    dec_filter.set_option(RS2_OPTION_FILTER_MAGNITUDE, 8); // 5-> 12288 , 6-> 8640
+        
+    // Enable hole-filling
+	// Hole filling is an aggressive heuristic and it gets the depth wrong many times
+	// However, this demo is not built to handle holes 
+	// (the shortest-path will always prefer to "cut" through the holes since they have zero 3D distance)
+	spat_filter.set_option(RS2_OPTION_HOLES_FILL, 5); // 5 = fill all the zero pixels
+    
     // Each depth camera might have different units for depth pixels, so we get it here
     // Using the pipeline's profile, we can retrieve the device that the pipeline uses
-    float depth_scale = get_depth_scale(profile.get_device());
-    
+    //float depth_scale = get_depth_scale(profile.get_device());
+    float depth_scale = sensor.get_depth_scale();         //result: depthscale: 0.001
+
     
     //Pipeline could choose a device that does not have a color stream
     //If there is no color stream, choose to align depth to another stream
@@ -158,11 +179,10 @@ int main(int argc, char * argv[]) try
     // Create a rs2::align object.
     // rs2::align allows us to perform alignment of depth frames to others frames
     //The "align_to" is the stream type to which we plan to align depth frames.
+    
     rs2::align align(align_to);
-    
-    
+       
 	pcl_ptr pcl_points (new pcl::PointCloud<pcl::PointXYZ>);
-    //pcl_ptr cloud (new pcl::PointCloud<pcl::PointXYZ>);
 
 	pcl::visualization::PCLVisualizer  cloud_viewer_("Cloud viewer");
   
@@ -171,6 +191,7 @@ int main(int argc, char * argv[]) try
     
     
     pcl_ptr downSizeCloud(new pcl::PointCloud<pcl::PointXYZ>);
+    
 	// Create the filtering object
 	pcl::VoxelGrid<pcl::PointXYZ> sor;
 
@@ -208,19 +229,46 @@ int main(int argc, char * argv[]) try
             align = rs2::align(align_to);
             depth_scale = get_depth_scale(profile.get_device());
         }
-        
+   
+ 
+		////////----start time------//////////
+		pt::ptime start = pt::microsec_clock::local_time();
+ 
         //Get processed aligned frame
         auto processed = align.process(frames);
         
 		// Trying to get both other and aligned depth frames
         rs2::video_frame other_frame = processed.first(align_to);
         rs2::depth_frame aligned_depth_frame = processed.get_depth_frame();
-              
+        
         //If one of them is unavailable, continue iteration
         if (!aligned_depth_frame || !other_frame)
         {
             continue;
         }
+              
+        rs2::frame filtered = aligned_depth_frame;
+        
+        ///////----start filter------/////////////
+        //pt::ptime start_filter = pt::microsec_clock::local_time();
+      
+		filtered = dec_filter.process(filtered);
+		
+		///////----end filter-----////////
+		//pt::ptime end_filter = pt::microsec_clock::local_time();
+		//pt::time_duration filter_diff = end_filter - start_filter;
+		//cout << "Filter Time difference is " <<  filter_diff.total_milliseconds() << " milliSeconds" << endl;
+		
+		
+		///////----start spat filter------/////////////
+        //pt::ptime start_spat_filter = pt::microsec_clock::local_time();
+       
+        filtered = spat_filter.process(filtered);
+       
+        ///////----end filter-----////////
+		//pt::ptime end_spat_filter = pt::microsec_clock::local_time();	
+		//pt::time_duration filter_spat_diff = end_spat_filter - start_spat_filter;
+		//cout << "Filter Time difference is " <<  filter_spat_diff.total_milliseconds() << " milliSeconds" << endl;
         
         // Passing both frames to remove_background so it will "strip" the background
         // NOTE: in this example, we alter the buffer of the other frame, instead of copying it and altering the copy
@@ -228,16 +276,21 @@ int main(int argc, char * argv[]) try
         //remove_background(other_frame, aligned_depth_frame, depth_scale, depth_clipping_distance);
         
         // Generate the pointcloud and texture mappings
-        points = pc.calculate(aligned_depth_frame);
-		
+        //points = pc.calculate(aligned_depth_frame);
+		points = pc.calculate(filtered);
+
+		//std::cout << "depthscale: " << depth_scale << "\n";
+		//std::cout << "min range: " << min << "\n";
+
 		std::cout << "points number: " << points.size() << "\n";
 
 		auto pcl_points = points_to_pcl(points);
-		
-		
-		/*
+			
 		sor.setInputCloud(pcl_points);
-		sor.setLeafSize(0.07f, 0.07f, 0.07f);
+		sor.setLeafSize(0.1f, 0.1f, 0.1f);
+		//sor.setLeafSize(0.15f, 0.15f, 0.15f); // 4000- 5000
+		//sor.setLeafSize(0.18f, 0.18f, 0.18f); // 2000- 3500
+
 		sor.filter(*downSizeCloud);
 		
 		tree->setInputCloud (downSizeCloud);
@@ -250,14 +303,13 @@ int main(int argc, char * argv[]) try
 		
 		tree2->setInputCloud (cloud_with_normals);
 		
-		
-		
-		 gp3.setSearchRadius(1.0);
-
+		//gp3.setSearchRadius(1.0);   //search radius = 1 m
+		gp3.setSearchRadius(0.2);		//search radius = 0.2 m
 
 		// Set typical values for the parameters
 		gp3.setMu (2.5);
-		gp3.setMaximumNearestNeighbors(80);
+		//gp3.setMaximumNearestNeighbors(80);
+		gp3.setMaximumNearestNeighbors(20);
 
 
 		gp3.setMaximumSurfaceAngle(M_PI/4); // 45 degrees
@@ -269,16 +321,33 @@ int main(int argc, char * argv[]) try
 		gp3.setInputCloud (cloud_with_normals);
 		gp3.setSearchMethod (tree2);
 		gp3.reconstruct (triangles);
-		*/
 		
+		std::cout << "--mesh --"<<triangles.polygons.size() << endl;
+		
+		
+		////////----end time------//////////
+		pt::ptime end = pt::microsec_clock::local_time();
+		pt::time_duration diff = end - start;
+		cout << "Time difference is " <<  diff.total_milliseconds() << " milliSeconds" << endl;
 		
 		cloud_viewer_.addPointCloud(pcl_points);
-		//cloud_viewer_.addPolygonMesh(triangles, "polygon");
+		cloud_viewer_.addPolygonMesh(triangles, "polygon");
 		
 		cloud_viewer_.spinOnce(100);
 
-        
+        // frame size  
+		const int w_rgb = other_frame.as<rs2::video_frame>().get_width();  
+		const int h_rgb = other_frame.as<rs2::video_frame>().get_height();  
 		
+		//std::cout << "RGB: w " << w_rgb << " \n";
+		//std::cout << "RGB: h " << h_rgb << " \n";
+		
+		
+		// frame size  
+		const int w_depth = aligned_depth_frame.as<rs2::video_frame>().get_width();  
+		const int h_depth = aligned_depth_frame.as<rs2::video_frame>().get_height();  
+		//std::cout << "DEPTH: w " << w_depth << " \n";
+		//std::cout << "DEPTH: h " << h_depth << " \n";
 	/*
 		        
         // Get the depth frame's dimensions
